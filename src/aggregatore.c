@@ -30,7 +30,7 @@ struct sockaddr_in initialize_socket(struct in_addr indirizzo, in_port_t porta, 
 int read_message(void* buffer, int file_descriptor, int byte_mancanti);
 void gestisci_sigpipe(int segnale);
 void gestisci_sigint(int segnale);
-void gestisci_sigalarm(int segnale);
+void manage_sigalarm(int segnale);
 /*
 Il coordinatore dovrà opportunamente gestire i seguenti segnali
 - SIGPIPE, inviato da un produttore quando  chiude la connessione,
@@ -50,16 +50,14 @@ dovrà creare un nuovo file di log, archiviando il precedente. // banalmente qui
 */
 
 // Questa funzione si occupa di controllare la dimensione del file di log e in caso di creare un nuovo log
-void signalHandler(int sig) {
-    if ( sig == SIGALRM) {
+void manage_sigalarm(int sig) {
+    if (sig == SIGALRM) {
         // devo verificare la dimensione del file di log
-        FILE *file = fopen("log.txt", "r");
         if (file != NULL) {
-            fseek(file, 0, SEEK_END);
-            long dimensione_corrente = ftell(file);
-            fclose(file);
-            if (dimensione_corrente > MAX_DIMENSION) {
-                // Creo un timestamp che sarà il nome di questo file;
+            struct stat stats;
+            if (stat("log.txt", &stats) != 0){
+                perror("Errore stats");
+                exit(-1);
                 // Archivio il file e ne creo uno nuovo con lo stesso nome
                 // dell'originale
                 time_t timestampCorrente = time(NULL);
@@ -79,12 +77,6 @@ void signalHandler(int sig) {
                 }
             }
         }
-        // Failsafe per creare un nuovo log
-        else {
-            FILE *newFile = fopen("log.txt", "w");
-            printf("Creazione di un nuovo log...");
-            fclose(newFile);
-        }
     }
     // Al termine, se la flag non è stata bloccata, reimposta un timer che richiamerà questo metodo a tempo debito
     if (routineFlag == 1) {
@@ -93,10 +85,12 @@ void signalHandler(int sig) {
 }
 
 int main(int argc, char* args[]){
-
+    if (argc < 2){
+        printf("Inserire in input PORTA")
+    }
     // Dopo aver indicato la funzione deputata a gestire il SIGALARM, setto la condizione del loop
     // ed inizializzo il primo alarm che darà avvio alla routine ciclica
-    signal (SIGALRM, signalHandler);
+    signal (SIGALRM, manage_sigalarm);
     routineFlag = 1;
     alarm(1);
 
