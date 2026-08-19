@@ -3,12 +3,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <stdio.h>       
-#include <unistd.h>      
+#include <stdbool.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <sys/file.h>   
 #include <netinet/in.h> 
 #include <arpa/inet.h>   
-#include <stdint.h>  
+#include <stdint.h>
+#include <time.h>
 
 
 typedef struct {
@@ -18,6 +20,11 @@ typedef struct {
 } MESSAGE;
 
 int const MAX_QUEUED = 100;
+// la dimensione massima consentita per il file
+int const MAX_DIMENSION = 2000000;
+// Flag globale per fermare la routine ( più duttile di un while true )
+int routineFlag = 0;
+
 
 struct sockaddr_in initialize_socket(struct in_addr indirizzo, in_port_t porta, int *socket_fd_pointer);    
 int read_message(void* buffer, int file_descriptor, int byte_mancanti);
@@ -34,7 +41,7 @@ Il coordinatore dovrà opportunamente gestire i seguenti segnali
   attenda che tutti i processi/thread abbiano terminato la scrittura e,
    infine, chiuda il file di log.
 
-Il Coordinatore, mediante l'uso di SIGALARM, 
+Il Coordinatore, mediante l'uso di SIGALRM,
 dovrà periodicamente verificare che il file di log 
 non superi una dimensione massima prefissata e, 
 qualora la dimensione massima sia stata raggiunta, 
@@ -42,8 +49,57 @@ dovrà creare un nuovo file di log, archiviando il precedente. // banalmente qui
 
 */
 
+// Questa funzione si occupa di controllare la dimensione del file di log e in caso di creare un nuovo log
+void signalHandler(int sig) {
+    if ( sig == SIGALRM) {
+        // devo verificare la dimensione del file di log
+        FILE *file = fopen("log.txt", "r");
+        if (file != NULL) {
+            fseek(file, 0, SEEK_END);
+            long dimensione_corrente = ftell(file);
+            fclose(file);
+            if (dimensione_corrente > MAX_DIMENSION) {
+                // Creo un timestamp che sarà il nome di questo file;
+                // Archivio il file e ne creo uno nuovo con lo stesso nome
+                // dell'originale
+                time_t timestampCorrente = time(NULL);
+                struct tm* tempoLocale = localtime(&timestampCorrente);
+                char timeStamp[20];
+                strftime(timeStamp, sizeof(timeStamp), "%Y%m%d_%H%M%S", tempoLocale);
+                char nomeLog[64];
+                snprintf(nomeLog, sizeof(nomeLog), "log_%s.txt", timeStamp);
+                if (rename("log.txt", nomeLog) == 0) {
+                    printf("File di log archiviato...");
+                    FILE *newFile = fopen("log.txt", "w");
+                    printf("Creazione di un nuovo log...");
+                    fclose(newFile);
+                }
+                else {
+                    printf("errore durante l'archiviazione del log...");
+                }
+            }
+        }
+        // Failsafe per creare un nuovo log
+        else {
+            FILE *newFile = fopen("log.txt", "w");
+            printf("Creazione di un nuovo log...");
+            fclose(newFile);
+        }
+    }
+    // Al termine, se la flag non è stata bloccata, reimposta un timer che richiamerà questo metodo a tempo debito
+    if (routineFlag == 1) {
+        alarm(1);
+    }
+}
 
 int main(int argc, char* args[]){
+
+    // Dopo aver indicato la funzione deputata a gestire il SIGALARM, setto la condizione del loop
+    // ed inizializzo il primo alarm che darà avvio alla routine ciclica
+    signal (SIGALRM, signalHandler);
+    routineFlag = 1;
+    alarm(1);
+
     //creo socket
     int sfd; // server file descriptor
     char *endptr; // puntatore per controllare argomenti
