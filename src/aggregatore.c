@@ -11,6 +11,7 @@
 #include <arpa/inet.h>   
 #include <stdint.h>
 #include <time.h>
+#include <sys/stat.h>
 
 
 typedef struct {
@@ -24,6 +25,10 @@ int const MAX_QUEUED = 100;
 int const MAX_DIMENSION = 2000000;
 // Flag globale per fermare la routine ( più duttile di un while true )
 int routineFlag = 0;
+// Id del processo che è associato a ciascun child
+uint32_t id_processo = 0;
+// Controllo della natura del processo
+int is_father = 1;
 
 
 struct sockaddr_in initialize_socket(struct in_addr indirizzo, in_port_t porta, int *socket_fd_pointer);    
@@ -51,15 +56,21 @@ dovrà creare un nuovo file di log, archiviando il precedente. // banalmente qui
 
 // Questa funzione si occupa di controllare la dimensione del file di log e in caso di creare un nuovo log
 void manage_sigalarm(int sig) {
+    // La funzione non è accessibile ai children
+    if (is_father == 0) return;
     if (sig == SIGALRM) {
         // devo verificare la dimensione del file di log
-        if (file != NULL) {
+        FILE *filelog = fopen("log.txt", "a");
+        if (filelog != NULL) {
+            fclose(filelog);
             struct stat stats;
-            if (stat("log.txt", &stats) != 0){
+            if (stat("log.txt", &stats) != 0) {
                 perror("Errore stats");
                 exit(-1);
-                // Archivio il file e ne creo uno nuovo con lo stesso nome
-                // dell'originale
+            }
+            // Archivio il file e ne creo uno nuovo con lo stesso nome
+            // dell'originale
+            if (stats.st_size >= MAX_DIMENSION) {
                 time_t timestampCorrente = time(NULL);
                 struct tm* tempoLocale = localtime(&timestampCorrente);
                 char timeStamp[20];
@@ -74,25 +85,51 @@ void manage_sigalarm(int sig) {
                 }
                 else {
                     printf("errore durante l'archiviazione del log...");
-                }
+                    }
             }
         }
+        // Al termine, se la flag non è stata bloccata, reimposta un timer che richiamerà questo metodo a tempo debito
+        if (routineFlag == 1) {
+            alarm(1);
+        }
     }
-    // Al termine, se la flag non è stata bloccata, reimposta un timer che richiamerà questo metodo a tempo debito
-    if (routineFlag == 1) {
-        alarm(1);
+}
+
+
+
+// Annotazione: fopen fprintf, localtime, etc... non sono "safe" nel sistema asincrono. Ma la traccia
+// richiede esplicitamente che l'handler scriva sui logs, quindi ignoriamo questo warning.
+void manage_sigpipe(int sig) {
+    // l'UID associato a questo child è nel campo id_processo
+    // prendo i locks sul file di log
+    FILE *log_file = fopen("log.txt", "a"); //apro il log file
+    if (log_file != NULL) {
+        int file_descriptor = fileno(log_file); //prendo il file descriptor
+        flock(file_descriptor, LOCK_EX); //faccio il lock
+        // Prendo il timestamp
+        time_t timestampCorrente = time(NULL);
+        struct tm* tempoLocale = localtime(&timestampCorrente);
+        char timeStamp[20];
+        strftime(timeStamp, sizeof(timeStamp), "%Y%m%d_%H%M%S", tempoLocale);
+        fprintf(log_file, "[%s, %u, DISCONNECT]\n", timeStamp, id_processo); //scrivo su file
+        fflush(log_file); //faccio flush per svuotare il buffer di fprintf
+        flock(file_descriptor, LOCK_UN); //rilascio il lock
+        fclose(log_file); //chiudo il file
+        // rilascio i locks
+        // ( controllare se viene killato il child in automatico)
     }
 }
 
 int main(int argc, char* args[]){
     if (argc < 2){
-        printf("Inserire in input PORTA")
+        printf("Inserire in input PORTA");
     }
     // Dopo aver indicato la funzione deputata a gestire il SIGALARM, setto la condizione del loop
     // ed inizializzo il primo alarm che darà avvio alla routine ciclica
     signal (SIGALRM, manage_sigalarm);
     routineFlag = 1;
     alarm(1);
+
 
     //creo socket
     int sfd; // server file descriptor
@@ -130,11 +167,17 @@ int main(int argc, char* args[]){
             continue;
         }
         if (fork() == 0){
+            // Imposto la flag del child
+            is_father = 0;
+            // Passo il SIGPIPE alla funzione deputata
+            signal (SIGPIPE, manage_sigpipe);
             close(sfd); // al figlio questo non serve più
             MESSAGE msg; // allochiamo un buffer
             while(read_message((void *)&msg, client_sd, sizeof(MESSAGE)) == 0){ // gestiamo la lettura
                 int32_t  timestamp = (int32_t) ntohl((uint32_t) msg.timestamp);
                 uint32_t uid = ntohl(msg.uid);
+                // Setto il campo ( serve per il SIGPIPE dei children)
+                id_processo = uid;
                 int32_t  dato = (int32_t) ntohl((uint32_t) msg.dato);
                 FILE *log_file = fopen("log.txt", "a"); //apro il log file
                 int file_descriptor = fileno(log_file); //prendo il file descriptor
@@ -144,8 +187,12 @@ int main(int argc, char* args[]){
                 flock(file_descriptor, LOCK_UN); //rilascio il lock
                 fclose(log_file); //chiudo il file
             }
+            // Genero la SIGPIPE
+            raise(SIGPIPE);
+            //close(client_sd); è ridondante perchè già viene chiusa con la exit
             exit(0); // il figlio non deve ricominciare il loop del padre
         }
+        close(client_sd);
     }
 }
 
