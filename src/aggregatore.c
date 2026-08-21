@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 
 typedef struct {
@@ -19,7 +20,9 @@ typedef struct {
     uint32_t uid;
     int32_t  dato;
 } MESSAGE;
-
+// qui ci metto i process id dei children per poter fare la wait sulla exit
+pid_t children[1000];
+int children_number = 0;
 int const MAX_QUEUED = 100;
 // la dimensione massima consentita per il file
 int const MAX_DIMENSION = 2000000;
@@ -29,6 +32,9 @@ int routineFlag = 0;
 uint32_t id_processo = 0;
 // Controllo della natura del processo
 int is_father = 1;
+// Flag per la exit controllata con SIGINT (volatile per essere riletta ogni ciclo, atomica perchè condivisa tra
+// signal handler e codice normale)
+volatile  sig_atomic_t exit_queued = 0;
 
 
 struct sockaddr_in initialize_socket(struct in_addr indirizzo, in_port_t porta, int *socket_fd_pointer);    
@@ -120,7 +126,16 @@ void manage_sigpipe(int sig) {
     }
 }
 
-int main(int argc, char* args[]){
+void manage_sigint(int sig) {
+    // Questa la riadattiamo una volta tolto definitivamente is_father
+    if (!is_father) return;
+    // Chiudo la routine di SIGLARM
+    routineFlag = 0;
+    // Chiudo la routine che accetta nuove connessioni
+    exit_queued = 1;
+}
+
+int main(int argc, char* args[]) {
     if (argc < 2){
         printf("Inserire in input PORTA");
     }
@@ -129,6 +144,9 @@ int main(int argc, char* args[]){
     signal (SIGALRM, manage_sigalarm);
     routineFlag = 1;
     alarm(1);
+
+    // Stessa cosa per SIGINT
+    signal (SIGINT, manage_sigint);
 
 
     //creo socket
@@ -142,11 +160,11 @@ int main(int argc, char* args[]){
         exit(1);
     }
     if (porta < 1 || porta > 65535) {
-       fprintf(stderr, "Porta non valida\n");
-       exit(1);
-   }
+        fprintf(stderr, "Porta non valida\n");
+        exit(1);
+    }
     struct in_addr indirizzo;
-    indirizzo.s_addr = htonl(INADDR_LOOPBACK); //ip su loopback 127.0.0.1 
+    indirizzo.s_addr = htonl(INADDR_LOOPBACK); //ip su loopback 127.0.0.1
     in_port_t porta_rete = htons((uint16_t) porta);
     struct sockaddr_in addr = initialize_socket(indirizzo, porta_rete, &sfd);
     // finito di creare la socket
@@ -156,17 +174,26 @@ int main(int argc, char* args[]){
     struct sigaction sa; // inizio a disabilitare sigchld
     memset(&sa, 0, sizeof(sa)); // svuoto sigaction
     sa.sa_handler = SIG_DFL; // si comporta di default quando lo vede
-    sa.sa_flags = SA_NOCLDWAIT;// non crea zombie quando i figli terminano
-    sigaction(SIGCHLD, &sa, NULL);//imposto 
+    //sa.sa_flags = SA_NOCLDWAIT;// non crea zombie quando i figli terminano
+
+    sigaction(SIGCHLD, &sa, NULL);//imposto
     //fine disabilitazione sigchld
-    while(1){
+    while(exit_queued == 0){
         socklen_t addrlen = sizeof(struct sockaddr);
         int client_sd = accept(sfd, (struct sockaddr *) &addr, &addrlen); // accetto un client
-        if(client_sd == -1){ 
-            if (errno != EINTR)  perror("Errore accettando client"); //gestisco l'errore dovuto a interrupt di sigalarm
-            continue;
+        if(client_sd == -1){
+            if (errno == EINTR) {
+                // Interrompo esplicitamente il ciclo se la exit_flag è settata
+                if (exit_queued) break;
+                    continue;
+            }
+                perror("Errore accettando client"); //gestisco l'errore dovuto a interrupt di sigalarm
+                continue;
+            }
         }
-        if (fork() == 0){
+        // Esplicito l'id_processo assegnato per definire se è child o meno e poterlo mettere in children
+        pid_t pid = fork();
+        if (pid == 0){
             // Imposto la flag del child
             is_father = 0;
             // Passo il SIGPIPE alla funzione deputata
@@ -192,53 +219,69 @@ int main(int argc, char* args[]){
             //close(client_sd); è ridondante perchè già viene chiusa con la exit
             exit(0); // il figlio non deve ricominciare il loop del padre
         }
+        else {
+            // Metto il pid nella struttura dati, con controllo per overflow
+            if (children_number < 1000) {
+                children[children_number++] = pid;
+            }
+        }
         close(client_sd);
     }
-}
+    // La flag per la terminazione controllata provoca la chiusura a nuove connessioni
+    // si aspetta che i figli abbiano finito e notifica il successo
+    // rispetto a prima se i processi terminano prima non ne impedisce la zombificazione
+    if (exit_queued == 1) {
+        close(sfd);
+        for (int i = 0; i < children_number; i++) {
+            waitpid(children[i], NULL, 0);
+        }
+        printf("Children hanno effettuato la exit correttamente");
 
-
-int read_message(void* buffer, int file_descriptor, int byte_mancanti){
-    int byte_letti = 0;
-    int r;
-    while(byte_letti < byte_mancanti){
-        r = read(file_descriptor, (char*)buffer + byte_letti, byte_mancanti - byte_letti);
-        if (r <= 0) return -1;  
-        byte_letti += r;
-    }
-    return 0;
-}
-
-struct sockaddr_in initialize_socket(struct in_addr indirizzo, in_port_t porta, int *socket_fd_pointer) {
-
-    int sd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sd == -1) {
-        perror("Errore creazione socket");
-        exit(-1);
     }
 
-    int opt = 1;
-    if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {//utilizzo reuseaddr
-        perror("Errore settaggio reuseaddr");  // se c'è errore usciamo 
-        exit(-1);
+
+    int read_message(void* buffer, int file_descriptor, int byte_mancanti){
+        int byte_letti = 0;
+        int r;
+        while(byte_letti < byte_mancanti){
+            r = read(file_descriptor, (char*)buffer + byte_letti, byte_mancanti - byte_letti);
+            if (r <= 0) return -1;
+            byte_letti += r;
+        }
+        return 0;
     }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr)); // azzeriamo addr e configuriamo per la connessione TCP
-    addr.sin_family = AF_INET; // tcp
-    addr.sin_port = porta; // porta
-    addr.sin_addr = indirizzo; // ip
+    struct sockaddr_in initialize_socket(struct in_addr indirizzo, in_port_t porta, int *socket_fd_pointer) {
 
-    if (bind(sd, (struct sockaddr*)&addr, sizeof(addr)) == -1) { // gestiamo errrori
-        perror("Errore socket bind");
-        exit(-1);
+        int sd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sd == -1) {
+            perror("Errore creazione socket");
+            exit(-1);
+        }
+
+        int opt = 1;
+        if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {//utilizzo reuseaddr
+            perror("Errore settaggio reuseaddr");  // se c'è errore usciamo
+            exit(-1);
+        }
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr)); // azzeriamo addr e configuriamo per la connessione TCP
+        addr.sin_family = AF_INET; // tcp
+        addr.sin_port = porta; // porta
+        addr.sin_addr = indirizzo; // ip
+
+        if (bind(sd, (struct sockaddr*)&addr, sizeof(addr)) == -1) { // gestiamo errrori
+            perror("Errore socket bind");
+            exit(-1);
+        }
+
+        if (listen(sd, MAX_QUEUED) == -1) { //gestione errori
+            perror("Errore socket listen");
+            exit(-1);
+        }
+
+        *socket_fd_pointer = sd;   // scrivo il fd nel puntatore passato dal chiamante
+
+        return addr;
     }
-
-    if (listen(sd, MAX_QUEUED) == -1) { //gestione errori
-        perror("Errore socket listen");
-        exit(-1);
-    }
-
-    *socket_fd_pointer = sd;   // scrivo il fd nel puntatore passato dal chiamante
-
-    return addr;
-}
