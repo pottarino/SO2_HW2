@@ -21,7 +21,9 @@ typedef struct {
     int32_t  dato;
 } MESSAGE;
 // qui ci metto i process id dei children per poter fare la wait sulla exit
-pid_t children[1000];
+int children_size = 1000;
+pid_t *children;
+
 int children_number = 0;
 int const MAX_QUEUED = 100;
 // la dimensione massima consentita per il file
@@ -136,6 +138,15 @@ void manage_sigint(int sig) {
 }
 
 int main(int argc, char* args[]) {
+
+    // Inizializzo l'allocazione dinamica della memoria per i children+
+    children = malloc(sizeof(pid_t)*children_size);
+    if (children == NULL) {
+        printf("Errore duranta l'allocazione iniziale della memoria...");
+        exit(EXIT_FAILURE);
+    }
+
+
     if (argc < 2){
         printf("Inserire in input PORTA");
     }
@@ -178,19 +189,37 @@ int main(int argc, char* args[]) {
 
     sigaction(SIGCHLD, &sa, NULL);//imposto
     //fine disabilitazione sigchld
-    while(exit_queued == 0){
+
+    while(exit_queued == 0) {
+
+        // Checko la size dell'array dei children: se la dimensione va riallocata devo controllarlo qui
+        if (children_number >= children_size) {
+            children_size *= 2;
+            pid_t *new_children = realloc(children, children_size*sizeof(pid_t));
+            if (new_children == NULL) {
+                printf("Errore durante l'allocazione della memoria per i children...");
+                // Non sono riuscito a riallocare la memoria, pertanto non posso più accogliere nuove
+                // Richieste; setto la flag per terminare
+                exit_queued = 1;
+                continue;
+            }
+            children = new_children;
+        }
+
+        // Se è andato tutto bene...
         socklen_t addrlen = sizeof(struct sockaddr);
         int client_sd = accept(sfd, (struct sockaddr *) &addr, &addrlen); // accetto un client
         if(client_sd == -1){
             if (errno == EINTR) {
                 // Interrompo esplicitamente il ciclo se la exit_flag è settata
                 if (exit_queued) break;
-                    continue;
-            }
-                perror("Errore accettando client"); //gestisco l'errore dovuto a interrupt di sigalarm
                 continue;
             }
+            perror("Errore accettando client"); //gestisco l'errore dovuto a interrupt di sigalarm
+            continue;
+
         }
+
         // Esplicito l'id_processo assegnato per definire se è child o meno e poterlo mettere in children
         pid_t pid = fork();
         if (pid == 0){
@@ -220,10 +249,8 @@ int main(int argc, char* args[]) {
             exit(0); // il figlio non deve ricominciare il loop del padre
         }
         else {
-            // Metto il pid nella struttura dati, con controllo per overflow
-            if (children_number < 1000) {
-                children[children_number++] = pid;
-            }
+            // Metto il pid nella struttura dati apposita
+            children[children_number++] = pid;
         }
         close(client_sd);
     }
@@ -285,3 +312,4 @@ int main(int argc, char* args[]) {
 
         return addr;
     }
+}
