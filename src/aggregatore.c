@@ -1,4 +1,4 @@
-    #include <sys/socket.h>
+#include <sys/socket.h>
 #include <signal.h>
 #include <string.h>
 #include <stdlib.h>
@@ -157,6 +157,12 @@ int main(int argc, char* args[]) {
         exit(EXIT_FAILURE);
     }
 
+    // Inizializzazione della sig mask per poter bloccare e ripristinare SIGCHILD durante la realloc
+    // Ed evitare memory leaks
+    sigset_t SIGCHLD_set, old_set;
+    sigemptyset(&SIGCHLD_set);
+    sigaddset(&SIGCHLD_set, SIGCHLD);
+
 
     if (argc < 2){
         printf("Inserire in input PORTA");
@@ -195,18 +201,27 @@ int main(int argc, char* args[]) {
 
     while(exit_queued == 0) {
 
+        // Qui comincia la sezione critica in cui bisogna tenere a freno SIGCHLD
+        sigprocmask(SIG_BLOCK, &SIGCHLD_set, &old_set);
+
         // Checko la size dell'array dei children: se la dimensione va riallocata devo controllarlo qui
         if (children_number >= children_size) {
             children_size *= 2;
-            children = realloc(children, children_size*sizeof(pid_t));
-            if (children == NULL) {
+            pid_t *tmp_children = realloc(children, children_size*sizeof(pid_t));
+            if (tmp_children == NULL) {
                 printf("Errore malloc");
+                // Sblocco la sezioen critica in caso di fallimento
+                sigprocmask(SIG_SETMASK, &old_set, NULL);
                 // Non sono riuscito a riallocare la memoria, pertanto non posso più accogliere nuove
                 // Richieste; setto la flag per terminare
                 exit_queued = 1;
                 continue;
             }
+            children = tmp_children;
         }
+
+        // Rilascio sezione critica
+        sigprocmask(SIG_SETMASK, &old_set, NULL);
 
         // Se è andato tutto bene...
         socklen_t addrlen = sizeof(struct sockaddr);
@@ -254,8 +269,12 @@ int main(int argc, char* args[]) {
             continue;
         }
         else{
+            // Apro sezione critica per registrare il pid
+            sigprocmask(SIG_BLOCK, &SIGCHLD_set, &old_set);
             // Metto il pid nella struttura dati apposita
             children[children_number++] = pid;
+            // CHiudo sezione critica
+            sigprocmask(SIG_SETMASK, &old_set, NULL);
         }
         close(client_sd);
     }
@@ -264,10 +283,10 @@ int main(int argc, char* args[]) {
     // rispetto a prima se i processi terminano prima non ne impedisce la zombificazione
     if (exit_queued == 1) {
         close(sfd);
-        signal(SIGCHLD, SIG_IGN); //ignoro sigchld, ora non mi serve più    
-        for (int i = 0; i < children_number; i++) {
-            waitpid(children[i], NULL, 0);
-        }
+        signal(SIGCHLD, SIG_DFL); //ignoro sigchld, ora non mi serve più
+        // Elimina la necessità di tracciare i singoli PID, si aspetta solo che non ci siano più figli
+        // Ergo funziona anche con un array disallineato
+        while(waitpid(-1, NULL, 0) > 0){}
         printf("tutti gli aggregatori sono disabilitati");
 
     }
