@@ -36,7 +36,7 @@ void manage_sigint(int segnale);
 void manage_sigalrm(int segnale);
 void close_connection(int sfd);
 void child_behaviour(int client_sd);
-void send_sigpipe(unsigned int numero);
+void send_sigpipe(uint32_t numero);
 
 int main(int argc, char* args[]) {
 
@@ -56,7 +56,7 @@ int main(int argc, char* args[]) {
         exit(1);
     }
     if (porta < 1 || porta > 65535) {
-        perror("Porta non valida\n");
+        fprintf(stderr, "Porta non valida: inserire numero tra 1 e 65535\n");
         exit(1);
     }
     // inizializziamo la struct per la socket
@@ -157,6 +157,8 @@ void manage_sigalrm(int sig) {
 }
 
 void manage_sigpipe(int sig, siginfo_t *info, void*other){
+    (void) other;
+    if(sig != SIGPIPE) return;
     uint32_t process_uid = (uint32_t) info->si_value.sival_int;
         FILE *log_file = fopen("log.txt", "a"); //apro il log file
     if (log_file != NULL) {
@@ -172,19 +174,18 @@ void manage_sigpipe(int sig, siginfo_t *info, void*other){
         flock(file_descriptor, LOCK_UN); //rilascio il lock
         fclose(log_file); //chiudo il file
         // rilascio i locks
-        // (controllare se viene killato il child in automatico)
     }
 
 }
 void manage_sigint(int sig) {
     // Chiudo la routine che accetta nuove connessioni e gestisce SIGALARM
-    exit_queued = 1;
+    if(sig == SIGINT) exit_queued = 1;
 }
 
 void close_connection(int sfd){
         close(sfd);
         //aspetto che tutti i figli terminino
-        waitpid(-1, NULL, 0);
+        while(waitpid(-1, NULL, 0) > 0);/*busy waiting*/
         printf("tutti gli aggregatori sono disabilitati\n");
 }
 
@@ -195,7 +196,7 @@ void child_behaviour(int client_sd){
     struct tm *tempoLocale;
     int32_t  dato;
     int file_descriptor;
-    unsigned long uid = 0;
+    uint32_t uid = 0;
     char timeStamp[50];
     // Gestione sigpipe 1..1 
     struct sigaction sa;
@@ -218,6 +219,7 @@ void child_behaviour(int client_sd){
 
         dato = (int32_t) ntohl((uint32_t) msg.dato);
         FILE *log_file = fopen("log.txt", "a"); //apro il log file
+        if(log_file == NULL) exit(-1);
         file_descriptor = fileno(log_file); //prendo il file descriptor
         flock(file_descriptor, LOCK_EX); //faccio il lock
         timestampCorrente = time(NULL); // prendo il timestamp
